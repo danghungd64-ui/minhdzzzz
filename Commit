@@ -1,0 +1,3 @@
+git add .
+git commit -m "fix: pin Python 3.12.7 để dùng pre-built wheels cho pydantic-core"
+git push origin main
