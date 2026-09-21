@@ -1,303 +1,329 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import List, Optional
-from datetime import datetime, timedelta
+"""
+Tai Xiu Prediction API v3.0.0
+Deploy trên Render: https://minhdzzzz-2.onrender.com
+"""
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import hashlib
 import time
+import random
 
-app = FastAPI(
-    title="Tai Xiu Prediction API - LEMINH",
-    description="API dự đoán Tài Xỉu có cache theo phiên + cooldown 30s.",
-    version="5.0.0"
-)
+app = Flask(__name__)
+CORS(app)  # Cho phép mọi domain gọi API (cần cho tool HTML)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ============================================================
+# CẤU HÌNH
+# ============================================================
+VERSION = "3.0.0"
+SERVICE_NAME = "Tai Xiu Prediction API"
+FEATURES = ["predict", "bridge_forecast", "session_follow"]
 
-# ---------------------------------------------------------
-# CACHE + COOLDOWN
-# ---------------------------------------------------------
-# Lưu kết quả dự đoán theo session để tránh đổi linh tinh
-PREDICTION_CACHE = {}   # {session: response_dict}
-
-# Cooldown theo session — chỉ cho dự đoán 1 lần / 30s / session
-LAST_PREDICT_TIME = {}  # {session: timestamp}
-COOLDOWN_SECONDS = 30
-
-# ---------------------------------------------------------
-# Models
-# ---------------------------------------------------------
-class SessionData(BaseModel):
-    session: int
-    dice: Optional[List[int]] = None
-    total: Optional[int] = None
-    result: Optional[str] = None
-
-class PredictRequest(BaseModel):
-    history: List[SessionData]
-    target_session: Optional[int] = None
-
-class PredictResponse(BaseModel):
-    target_session: int
-    prediction: str
-    confidence: float
-    confidence_tai: float
-    confidence_xiu: float
-    detected_bridge: str
-    analysis: dict
-    gap: Optional[int] = 1
-    cached: Optional[bool] = False
-
-# ---------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------
-def preprocess_history(history: List[SessionData]) -> List[dict]:
-    processed = []
-    for item in history:
-        total = item.total if item.total is not None else (
-            sum(item.dice) if item.dice else None
-        )
-        if total is None:
-            continue
-        res = item.result.lower() if item.result else ("tai" if total >= 11 else "xiu")
-        processed.append({
-            "session": item.session,
-            "total": total,
-            "result": res
-        })
-    return processed
+# Lưu session tạm thời trong memory
+sessions = {}
 
 
-def detect_streak(results: List[str]) -> int:
-    if not results:
-        return 0
-    last = results[-1]
-    streak = 1
-    for i in range(len(results) - 2, -1, -1):
-        if results[i] == last:
-            streak += 1
-        else:
-            break
-    return streak
-
-
-def detect_alternating(results: List[str]) -> int:
-    if len(results) < 2:
-        return 0
-    count = 1
-    for i in range(len(results) - 2, -1, -1):
-        if results[i] != results[i + 1]:
-            count += 1
-        else:
-            break
-    return count
-
-
-def detect_2_2(results: List[str]) -> Optional[str]:
-    if len(results) < 4:
-        return None
-    last4 = results[-4:]
-    if last4 == ["tai", "tai", "xiu", "xiu"]:
-        return "tai"
-    if last4 == ["xiu", "xiu", "tai", "tai"]:
-        return "xiu"
-    return None
-
-
-def detect_3_3(results: List[str]) -> Optional[str]:
-    if len(results) < 6:
-        return None
-    last6 = results[-6:]
-    if last6 == ["tai", "tai", "tai", "xiu", "xiu", "xiu"]:
-        return "tai"
-    if last6 == ["xiu", "xiu", "xiu", "tai", "tai", "tai"]:
-        return "xiu"
-    return None
-
-
-def analyze_bridge_pattern(results: List[str], totals: List[int]) -> tuple:
-    n = len(results)
-    if n == 0:
-        return "tai", "Chưa đủ dữ liệu", 0.50, "Cần tối thiểu 1 phiên."
-
-    last_res = results[-1]
-    opposite = "xiu" if last_res == "tai" else "tai"
-    last_total = totals[-1]
-
-    streak = detect_streak(results)
-    alt = detect_alternating(results)
-
-    p3 = detect_3_3(results)
-    if p3:
-        return p3, "Cầu 3-3", 0.74, f"Mẫu 3-3 hoàn tất, dự đoán {p3.upper()}."
-
-    p2 = detect_2_2(results)
-    if p2:
-        return p2, "Cầu 2-2", 0.70, f"Mẫu 2-2 hoàn tất, dự đoán {p2.upper()}."
-
-    if streak >= 5:
-        return last_res, "Cầu Bệt Mạnh", 0.80, f"Bệt {last_res.upper()} {streak} phiên."
-    if streak >= 4:
-        return last_res, "Cầu Bệt", 0.74, f"Bệt {last_res.upper()} {streak} phiên."
-    if streak >= 3:
-        return last_res, "Cầu Bệt Nhẹ", 0.66, f"Bệt {last_res.upper()} {streak} phiên."
-
-    if alt >= 5:
-        return opposite, "Cầu 1-1 Mạnh", 0.76, f"Đan xen {alt} phiên, đổi {opposite.upper()}."
-    if alt >= 3:
-        return opposite, "Cầu 1-1", 0.68, f"Đan xen {alt} phiên, đổi {opposite.upper()}."
-
-    if last_total >= 15:
-        return "xiu", "Cầu Đảo (Điểm Cực Cao)", 0.76, f"Điểm {last_total} cực cao, bẻ XỈU."
-    if last_total <= 6:
-        return "tai", "Cầu Đảo (Điểm Cực Thấp)", 0.76, f"Điểm {last_total} cực thấp, bẻ TÀI."
-
-    if last_total >= 11:
-        return "xiu", "Cầu Đảo Nhẹ", 0.60, f"Điểm {last_total} vùng TÀI, nghiêng XỈU."
-    return "tai", "Cầu Đảo Nhẹ", 0.60, f"Điểm {last_total} vùng XỈU, nghiêng TÀI."
-
-
-def compute_confidence(prediction: str, confidence: float) -> tuple:
-    if prediction == "tai":
-        return round(confidence, 4), round(1.0 - confidence, 4)
-    return round(1.0 - confidence, 4), round(confidence, 4)
-
-
-def history_signature(processed: List[dict]) -> str:
-    """Tạo hash từ history để phát hiện thay đổi."""
-    raw = "|".join(f"{p['session']}:{p['result']}" for p in processed)
- HTTP    return hashlib.md5(raw.encode()).hexdigest()[:12]
-
-
-# ---------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------
-@app.get("/")
-def home():
-    """Health check + session mẫu."""
-    return {
+# ============================================================
+# ROOT ENDPOINT - Kiểm tra API online
+# ============================================================
+@app.route('/', methods=['GET'])
+def root():
+    return jsonify({
         "status": "online",
-        "service": "Tai Xiu Prediction API - LEMINH",
-        "version": "5.0.0",
-        "current_session": int(datetime.now().timestamp()) % 100000000,
-        "features": ["predict", "confidence_tai_xiu", "cache_by_session", "cooldown_30s"]
-    }
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "features": FEATURES,
+        "docs_url": "/docs"
+    })
 
 
-@app.post("/predict", response_model=PredictResponse)
-def predict_tai_xiu(data: PredictRequest):
-    if not data.history:
-        raiseException(status_code=400, detail="Mảng 'history' không được để trống.")
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        "status": "healthy",
+        "timestamp": int(time.time()),
+        "version": VERSION
+    })
 
-    sorted_history = sorted(data.history, key=lambda x: x.session)
-    processed = preprocess_history(sorted_history)
 
-    if not processed:
-        raise HTTPException(status_code=400, detail="Không có dữ liệu hợp lệ.")
+# ============================================================
+# THUẬT TOÁN DỰ ĐOÁN TÀI XỈU (nâng cao)
+# ============================================================
+def predict_tai_xiu(md5_hash: str) -> dict:
+    """
+    Thuật toán dự đoán dựa trên MD5 hashhex.
+   dig Kết hợp nhiều vùng dữ liệu để tăng độ phân tán.
+    """
+    if not md5_hash or len(md5_hash) < 32:
+        # Fallback nếu hash không hợp lệ
+        md5_hash = hashlib.md5(str(time.time()).encode()).est()
 
-    results = [item["result"] for item in processed]
-    totals = [item["total"] for item in processed]
-    last_session = processed[-1]["session"]
+    try:
+        # Lấy 3 vùng dữ liệu từ hash
+        head = int(md5_hash[0:8], 16)
+        mid = int(md5_hash[8:16], 16)
+        tail = int(md5_hash[-8:], 16)
 
-    target = data.target_session if data.target_session else last_session + 1
-    if target <= last_session:
-        raise HTTPException(
-            status_code=400,
-            detail=f"'target_session' ({target}) phải lớn hơn phiên cuối ({last_session})."
-        )
+        # Kết hợp với hệ số nguyên tố
+        combined = (head * 13 + mid * 17 + tail * 31) & 0xFFFFFFFF
 
-    # ---------------------------------------------------------
-    # 1. KIỂM TRA CACHE — không đổi kết quả cho cùng phiên
-    # ---------------------------------------------------------
-    sig = history_signature(processed)
-    cache_key = f"{target}_{sig}"
+        # XOR diffusion (tăng độ ngẫu nhiên)
+        combined ^= (combined >> 16)
+        combined = (combined * 0x9E3779B9) & 0xFFFFFFFF
+        combined ^= (combined >> 13)
+        combined = (combined * 0x85EBCA6B) & 0xFFFFFFFF
+        combined ^= (combined >> 16)
 
-    if cache_key in PREDICTION_CACHE:
-        cached = PREDICTION_CACHE[cache_key].copy()
-        cached["cached"] = True
-        return cached
+        # Trích xuất xác suất
+        last_byte = combined & 0xFF
+        second_byte = (combined >> 8) & 0xFF
 
-    # ---------------------------------------------------------
-    # 2. COOLDOWN 30s — không dự đoán lại cùng phiên trong 30s
-    # ---------------------------------------------------------
-    now = time.time()
-    if target in LAST_PREDICT_TIME:
-        elapsed = now - LAST_PREDICT_TIME[target]
-        if elapsed < COOLDOWN_SECONDS:
-            # Trả kết quả cache nếu có
-            if cache_key in PREDICTION_CACHE:
-                cached = PREDICTION_CACHE[cache_key].copy()
-                cached["cached"] = True
-                return cached
-            # Nếu không có cache, trả lỗi 429
-            raise HTTPException(
-                status_code=429,
-                detail=f"Phiên {target} vừa dự đoán {elapsed:.1f}s trước. Chờ thêm {COOLDOWN_SECONDS - elapsed:.1f}s."
-            )
+        # Tính % Tài (dao động 25% - 75%)
+        tai_percent = ((last_byte / 255) * 50) + 25
+        tai_percent += ((second_byte / 255) * 10) - 5
+        tai_percent = max(25, min(75, tai_percent))
 
-    # ---------------------------------------------------------
-    # 3. TÍNH DỰ ĐOÁN
-    # ---------------------------------------------------------
-    gap = target - last_session
-    prediction, bridge, confidence, note = analyze_bridge_pattern(results, totals)
-    c_tai, c_xiu = compute_confidence(prediction, confidence)
+        # Làm tròn
+        tai_percent = round(tai_percent, 1)
+        xiu_percent = round(100 - tai_percent, 1)
 
-    response = {
-        "target_session": target,
-        "prediction": prediction,
-        "confidence": round(confidence, 4),
-        "confidence_tai": c_tai,
-        "confidence_xiu": c_xiu,
-        "detected_bridge": bridge,
-        "analysis": {
-            "last_session": last_session,
-            "last_total": totals[-1],
-            "last_result": results[-1],
-            "total_analyzed_sessions": len(processed),
-            "gap_from_last": gap,
-            "note": note,
-            "history_signature": sig
+        result = "Tài" if tai_percent >= 50 else "Xỉu"
+        confidence = round(max(tai_percent, xiu_percent))
+
+        return {
+            "success": True,
+            "result": result,
+            "prediction": result.lower(),
+            "confidence": confidence,
+            "tai_percent": tai_percent,
+            "xiu_percent": xiu_percent,
+            "algorithm": "MD5 Hybrid Diffusion v3",
+            "version": VERSION
+        }
+
+    except Exception as e:
+        # Nếu có lỗi, trả về fallback
+        return {
+            "success": False,
+            "result": "Tài",
+            "prediction": "tai",
+            "confidence": 50,
+            "tai_percent": 50.0,
+            "xiu_percent": 50.0,
+            "algorithm": "Fallback",
+            "error": str(e),
+            "version": VERSION
+        }
+
+
+# ============================================================
+# ENDPOINT /predict - POST (chính)
+# ============================================================
+@app.route('/predict', methods=['POST'])
+def predict_post():
+    data = request.get_json(silent=True) or {}
+
+    # Nhận md5 hoặc hash từ nhiều key khác nhau
+    md5_hash = data.get('md5') or data.get('hash') or data.get('input') or ''
+
+    if not md5_hash:
+        return jsonify({
+            "success": False,
+            "error": "Missing 'md5' or 'hash' field",
+            "hint": "Send JSON: {\"md5\": \"your_hash_here\"}"
+        }), 400
+
+    md5_hash = str(md5_hash).strip()
+    result = predict_tai_xiu(md5_hash)
+
+    # Thêm thông tin session
+    session_id = hashlib.md5(
+        (md5_hash + str(int(time.time() // 60))).encode()
+    ).hexdigest()[:12]
+
+    result["session"] = session_id
+    result["input_hash"] = md5_hash
+
+    return jsonify(result)
+
+
+# ============================================================
+# ENDPOINT /predict - GET
+# ============================================================
+@app.route('/predict', methods=['GET'])
+def predict_get():
+    md5_hash = request.args.get('md5') or request.args.get('hash') or ''
+
+    if not md5_hash:
+        return jsonify({
+            "success": False,
+            "error": "Missing 'md5' query parameter",
+            "hint": "Call: /predict?md5=your_hash"
+        }), 400
+
+    md5_hash = str(md5_hash).strip()
+    result = predict_tai_xiu(md5_hash)
+
+    session_id = hashlib.md5(
+        (md5_hash + str(int(time.time() // 60))).encode()
+    ).hexdigest()[:12]
+
+    result["session"] = session_id
+    result["input_hash"] = md5_hash
+
+    return jsonify(result)
+
+
+# ============================================================
+# ENDPOINT /bridge_forecast - Dự phòng
+# ============================================================
+@app.route('/bridge_forecast', methods=['POST', 'GET'])
+def bridge_forecast():
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        md5_hash = data.get('md5') or data.get('hash') or ''
+    else:
+        md5_hash = request.args.get('md5') or request.args.get('hash') or ''
+
+    if not md5_hash:
+        return jsonify({
+            "success": False,
+            "error": "Missing input hash"
+        }), 400
+
+    md5_hash = str(md5_hash).strip()
+
+    # Bridge forecast: kết hợp thêm yếu tố thời gian
+    base = predict_tai_xiu(md5_hash)
+    time_seed = int(time.time() // 300)  # Đổi mỗi 5 phút
+    extra_hash = hashlib.md5(f"{md5_hash}_{time_seed}".encode()).hexdigest()
+    extra_val = int(extra_hash[:8], 16) % 20 - 10  # -10 .. +10
+
+    # Điều chỉnh nhẹ
+    adjusted_tai = base["tai_percent"] + extra_val * 0.3
+    adjusted_tai = max(20, min(80, adjusted_tai))
+    adjusted_tai = round(adjusted_tai, 1)
+
+    result = "Tài" if adjusted_tai >= 50 else "Xỉu"
+
+    return jsonify({
+        "success": True,
+        "result": result,
+        "prediction": result.lower(),
+        "confidence": round(max(adjusted_tai, 100 - adjusted_tai)),
+        "tai_percent": adjusted_tai,
+        "xiu_percent": round(100 - adjusted_tai, 1),
+        "algorithm": "Bridge Forecast v3",
+        "bridge_offset": extra_val,
+        "version": VERSION
+    })
+
+
+# ============================================================
+# ENDPOINT /session_follow - Theo dõi session
+# ============================================================
+@app.route('/session_follow', methods=['POST', 'GET'])
+def session_follow():
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        session_id = data.get('session_id') or data.get('session') or ''
+    else:
+        session_id = request.args.get('session_id') or request.args.get('session') or ''
+
+    if not session_id:
+        return jsonify({
+            "success": False,
+            "error": "Missing session_id"
+        }), 400
+
+    session_id = str(session_id).strip()
+
+    if session_id not in sessions:
+        sessions[session_id] = {
+            "created": int(time.time()),
+            "predictions": []
+        }
+
+    session_data = sessions[session_id]
+
+    # Dự đoán tiếp theo dựa trên lịch sử session
+    history_str = ''.join(session_data["predictions"][-10:])
+    if history_str:
+        follow_hash = hashlib.md5((session_id + history_str).encode()).hexdigest()
+    else:
+        follow_hash = hashlib.md5(session_id.encode()).hexdigest()
+
+    result = predict_tai_xiu(follow_hash)
+    result["session_id"] = session_id
+    result["session_length"] = len(session_data["predictions"])
+
+    return jsonify(result)
+
+
+# ============================================================
+# ENDPOINT /docs - Tài liệu API
+# ============================================================
+@app.route('/docs', methods=['GET'])
+def docs():
+    return jsonify({
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "endpoints": {
+            "GET /": "Kiểm tra trạng thái API",
+            "GET /health": "Health check",
+            "POST /predict": "Dự đoán tài xỉu (JSON: {md5})",
+            "GET /predict?md5=...": "Dự đoán tài xỉu (query param)",
+            "POST /bridge_forecast": "Dự đoán nâng cao",
+            "POST /session_follow": "Theo dõi session",
+            "GET /docs": "Tài liệu này"
         },
-        "gap": gap,
-        "cached": False
-    }
-
-    # Lưu cache + timestamp
-    PREDICTION_CACHE[cache_key] = response
-    LAST_PREDICT_TIME[target] = now
-
-    # Giới hạn cache size
-    if len(PREDICTION_CACHE) > 500:
-        keys = list(PREDICTION_CACHE.keys())[:100]
-        for k in keys:
-            del PREDICTION_CACHE[k]
-    if len(LAST_PREDICT_TIME) > 500:
-        keys = list(LAST_PREDICT_TIME.keys())[:100]
-        for k in keys:
-            del LAST_PREDICT_TIME[k]
-
-    return response
+        "examples": {
+            "predict": {
+                "url": "/predict",
+                "method": "POST",
+                "body": {"md5": "e10adc3949ba59abbe56e057f20f883e"}
+            },
+            "response": {
+                "success": True,
+                "result": "Tài",
+                "confidence": 68,
+                "tai_percent": 68.5,
+                "xiu_percent": 31.5,
+                "algorithm": "MD5 Hybrid Diffusion v3",
+                "session": "a1b2c3d4e5f6"
+            }
+        }
+    })
 
 
-@app.get("/cache/status")
-def cache_status():
-    """Xem trạng thái cache."""
-    return {
-        "cached_sessions": len(PREDICTION_CACHE),
-        "cooldown_seconds": COOLDOWN_SECONDS,
-        "sessions_in_cooldown": len(LAST_PREDICT_TIME)
-    }
+# ============================================================
+# ERROR HANDLERS
+# ============================================================
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({
+        "success": False,
+        "error": "Endpoint not found",
+        "available": ["/", "/health", "/predict", "/bridge_forecast", "/session_follow", "/docs"]
+    }), 404
 
 
-@app.delete("/cache/clear")
-def cache_clear():
-    """Xoá cache (dùng khi cần reset)."""
-    PREDICTION_CACHE.clear()
-    LAST_PREDICT_TIME.clear()
-    return {"status": "cleared"}
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify({
+        "success": False,
+        "error": "Internal server error",
+        "message": str(e)
+    }), 500
+
+
+# ============================================================
+# CHẠY SERVER
+# ============================================================
+if __name__ == '__main__':
+    import os
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
