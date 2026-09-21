@@ -1,17 +1,15 @@
 {
-  "history": [
-    {
-      "session": 7056495,
-      "dice": [4, 1, 3],
-      "total": 8,
-      "result": "xiu"
-    },
-    {
-      "session": 7056496,
-      "dice": [1, 6, 6],
-      "total": 13,
-      "result": "tai"
-    }
-  ],
-  "target_session": 7056497
+  "target_session": 7056562,
+  "prediction": "tai",
+  "confidence": 0.72,
+  "detected_bridge": "Cầu Bệt",
+  "analysis": {
+    "last_session": 7056561,
+    "last_total": 13,
+    "last_result": "tai",
+    "total_analyzed_sessions": 2,
+    "gap_from_last": 1,
+    "note": "Đang bệt TÀI 2 phiên."
+  },
+  "gap": 1
 }
