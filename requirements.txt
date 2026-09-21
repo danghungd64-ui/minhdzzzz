@@ -1,4 +1,3 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-pydantic==2.10.6
---only-binary=:all:
+flask==3.0.0
+flask-cors==4.0.0
+gunicorn==21.2.0
