@@ -1,19 +1,30 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
+from datetime import datetime
 
 app = FastAPI(
-    title="Tai Xiu Prediction API - Cau Analysis",
-    description="API dự đoán Tài Xỉu theo session ID thực tế. Tự động chạy cầu từ phiên cuối đến target_session.",
-    version="3.0.0"
+    title="Tai Xiu Prediction API - LEMINH",
+    description="API dự đoán Tài Xỉu theo phiên game. Trả về % Tài / % Xỉu chuẩn thuật toán cầu.",
+    version="4.0.0"
+)
+
+# CORS cho phép mọi nguồn gọi API (kể cả tool HTML)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ---------------------------------------------------------
 # Models
 # ---------------------------------------------------------
 class SessionData(BaseModel):
-    session: int = Field(..., description="Mã phiên (VD: 7056495)")
-    dice: List[int] = Field(..., min_items=3, max_items=3, description="Mảng 3 xúc xắc")
+    session: int = Field(..., description="Mã phiên (VD: 7056560)")
+    dice: Optional[List[int]] = Field(None, description="3 xúc xắc")
     total: Optional[int] = None
     result: Optional[str] = None
 
@@ -21,21 +32,15 @@ class PredictRequest(BaseModel):
     history: List[SessionData]
     target_session: Optional[int] = None
 
-class BridgeStep(BaseModel):
-    session: int
-    prediction: str
-    confidence: float
-    bridge: str
-
 class PredictResponse(BaseModel):
     target_session: int
-    prediction: str
-    confidence: float
+    prediction: str                       # "tai" hoặc "xiu"
+    confidence: float                     # 0.30 – 0.98
+    confidence_tai: float                 # % TÀI
+    confidence_xiu: float                 # % XỈU
     detected_bridge: str
     analysis: dict
-    bridge_forecast: Optional[List[BridgeStep]] = None
-    forecast_until: Optional[int] = None
-    gap: Optional[int] = None
+    gap: Optional[int] = 1
 
 # ---------------------------------------------------------
 # Helpers
@@ -43,14 +48,15 @@ class PredictResponse(BaseModel):
 def preprocess_history(history: List[SessionData]) -> List[dict]:
     processed = []
     for item in history:
-        dice_sum = sum(item.dice) if item.dice else item.total
-        if dice_sum is None:
+        total = item.total if item.total is not None else (
+            sum(item.dice) if item.dice else None
+        )
+        if total is None:
             continue
-        res = item.result.lower() if item.result else ("tai" if dice_sum >= 11 else "xiu")
+        res = item.result.lower() if item.result else ("tai" if total >= 11 else "xiu")
         processed.append({
             "session": item.session,
-            "dice": item.dice,
-            "total": dice_sum,
+            "total": total,
             "result": res
         })
     return processed
@@ -81,7 +87,7 @@ def detect_alternating(results: List[str]) -> int:
     return count
 
 
-def detect_2_2_pattern(results: List[str]) -> Optional[str]:
+def detect_2_2(results: List[str]) -> Optional[str]:
     if len(results) < 4:
         return None
     last4 = results[-4:]
@@ -92,7 +98,7 @@ def detect_2_2_pattern(results: List[str]) -> Optional[str]:
     return None
 
 
-def detect_3_3_pattern(results: List[str]) -> Optional[str]:
+def detect_3_3(results: List[str]) -> Optional[str]:
     if len(results) < 6:
         return None
     last6 = results[-6:]
@@ -104,80 +110,68 @@ def detect_3_3_pattern(results: List[str]) -> Optional[str]:
 
 
 def analyze_bridge_pattern(results: List[str], totals: List[int]) -> tuple:
+    """
+    Trả về: (prediction, bridge_name, confidence, note)
+    """
     n = len(results)
     if n == 0:
-        return "tai", "Chưa đủ dữ liệu", 0.50, "Cần tối thiểu dữ liệu lịch sử."
+        return "tai", "Chưa đủ dữ liệu", 0.50, "Cần tối thiểu 1 phiên."
 
     last_res = results[-1]
-    opposite_res = "xiu" if last_res == "tai" else "tai"
+    opposite = "xiu" if last_res == "tai" else "tai"
     last_total = totals[-1]
 
     streak = detect_streak(results)
     alt = detect_alternating(results)
 
-    p3 = detect_3_3_pattern(results)
+    # 1. Cầu 3-3
+    p3 = detect_3_3(results)
     if p3:
-        return p3, "Cầu 3-3", 0.70, f"Mẫu 3-3 hoàn tất, dự đoán {p3.upper()}."
+        return p3, "Cầu 3-3", 0.74, f"Mẫu 3-3 hoàn tất, dự đoán {p3.upper()}."
 
-    p2 = detect_2_2_pattern(results)
+    # 2. Cầu 2-2
+    p2 = detect_2_2(results)
     if p2:
-        return p2, "Cầu 2-2", 0.66, f"Mẫu 2-2 hoàn tất, dự đoán {p2.upper()}."
+        return p2, "Cầu 2-2", 0.70, f"Mẫu 2-2 hoàn tất, dự đoán {p2.upper()}."
 
+    # 3. Cầu bệt
+    if streak >= 5:
+        return last_res, "Cầu Bệt Mạnh", 0.80, f"Bệt {last_res.upper()} {streak} phiên liên tiếp."
     if streak >= 4:
-        return last_res, "Cầu Bệt", 0.72, f"Đang bệt {last_res.upper()} {streak} phiên liên tiếp."
+        return last_res, "Cầu Bệt", 0.74, f"Bệt {last_res.upper()} {streak} phiên."
+    if streak >= 3:
+        return last_res, "Cầu Bệt Nhẹ", 0.66, f"Bệt {last_res.upper()} {streak} phiên."
 
-    if alt >= 4:
-        return opposite_res, "Cầu 1-1", 0.68, f"Đan xen {alt} phiên, đổi sang {opposite_res.upper()}."
+    # 4. Cầu 1-1
+    if alt >= 5:
+        return opposite, "Cầu 1-1 Mạnh", 0.76, f"Đan xen {alt} phiên, đổi sang {opposite.upper()}."
+    if alt >= 3:
+        return opposite, "Cầu 1-1", 0.68, f"Đan xen {alt} phiên, đổi sang {opposite.upper()}."
 
+    # 5. Bẻ cầu theo biên độ điểm
     if last_total >= 15:
-        return "xiu", "Cầu Đảo (Điểm Cực Cao)", 0.74, f"Điểm {last_total} cực cao, khả năng bẻ XỈU."
+        return "xiu", "Cầu Đảo (Điểm Cực Cao)", 0.76, f"Điểm {last_total} cực cao, bẻ XỈU."
     if last_total <= 6:
-        return "tai", "Cầu Đảo (Điểm Cực Thấp)", 0.74, f"Điểm {last_total} cực thấp, khả năng bẻ TÀI."
+        return "tai", "Cầu Đảo (Điểm Cực Thấp)", 0.76, f"Điểm {last_total} cực thấp, bẻ TÀI."
 
+    # 6. Đảo nhẹ
     if last_total >= 11:
-        return "xiu", "Cầu Đảo Nhẹ", 0.58, f"Điểm {last_total} vùng TÀI, nghiêng về XỈU."
-    return "tai", "Cầu Đảo Nhẹ", 0.58, f"Điểm {last_total} vùng XỈU, nghiêng về TÀI."
+        return "xiu", "Cầu Đảo Nhẹ", 0.60, f"Điểm {last_total} vùng TÀI, nghiêng XỈU."
+    return "tai", "Cầu Đảo Nhẹ", 0.60, f"Điểm {last_total} vùng XỈU, nghiêng TÀI."
 
 
-def simulate_next_totals(pred: str) -> int:
-    """Tổng điểm giả lập dựa trên dự đoán (Tài ≥ 11, Xỉu ≤ 10)."""
-    return 12 if pred == "tai" else 9
-
-
-def forecast_bridge_until(results: List[str], totals: List[int],
-                          last_session: int, target_session: int) -> List[dict]:
+def compute_both_confidence(prediction: str, confidence: float) -> tuple:
     """
-    Chạy cầu từ last_session+1 → target_session theo ĐÚNG session ID.
-    Không giới hạn bước — hỗ trợ khoảng cách lớn (VD: 7056496 → 7056500).
+    Tính % Tài và % Xỉu dựa trên prediction + confidence.
+    VD: prediction=tai, confidence=0.72 → Tài 72%, Xỉu 28%
     """
-    steps = []
-    if target_session <= last_session:
-        return steps
-
-    gap = target_session - last_session
-
-    # Giới hạn an toàn: nếu gap > 500 → chỉ mô phỏng 500 bước cuối để tránh treo API
-    MAX_GAP = 500
-    if gap > MAX_GAP:
-        start = target_session - MAX_GAP
+    if prediction == "tai":
+        c_tai = confidence
+        c_xiu = 1.0 - confidence
     else:
-        start = last_session + 1
-
-    sim_results = list(results)
-    sim_totals = list(totals)
-
-    for session in range(start, target_session + 1):
-        pred, bridge, conf, _ = analyze_bridge_pattern(sim_results, sim_totals)
-        steps.append({
-            "session": session,
-            "prediction": pred,
-            "confidence": round(conf, 4),
-            "bridge": bridge
-        })
-        sim_results.append(pred)
-        sim_totals.append(simulate_next_totals(pred))
-
-    return steps
+        c_xiu = confidence
+        c_tai = 1.0 - confidence
+    return round(c_tai, 4), round(c_xiu, 4)
 
 
 # ---------------------------------------------------------
@@ -185,11 +179,13 @@ def forecast_bridge_until(results: List[str], totals: List[int],
 # ---------------------------------------------------------
 @app.get("/")
 def home():
+    """Health check + trả session mẫu để tool biết API đang online."""
     return {
         "status": "online",
-        "service": "Tai Xiu Prediction API",
-        "version": "3.0.0",
-        "features": ["predict", "bridge_forecast", "session_follow"],
+        "service": "Tai Xiu Prediction API - LEMINH",
+        "version": "4.0.0",
+        "current_session": int(datetime.now().timestamp()) % 100000000,
+        "features": ["predict", "confidence_tai_xiu"],
         "docs_url": "/docs"
     }
 
@@ -203,45 +199,34 @@ def predict_tai_xiu(data: PredictRequest):
     processed = preprocess_history(sorted_history)
 
     if not processed:
-        raise HTTPException(status_code=400, detail="Không có dữ liệu hợp lệ sau khi xử lý.")
+        raise HTTPException(status_code=400, detail="Không có dữ liệu hợp lệ.")
 
     results = [item["result"] for item in processed]
     totals = [item["total"] for item in processed]
-
     last_session = processed[-1]["session"]
 
-    # Nếu không truyền target → mặc định phiên kế tiếp (last + 1)
+    # Nếu không truyền target → mặc định last + 1
     target = data.target_session if data.target_session else last_session + 1
-
-    # Validate target > last
     if target <= last_session:
         raise HTTPException(
             status_code=400,
-            detail=f"'target_session' ({target}) phải lớn hơn phiên cuối trong history ({last_session})."
+            detail=f"'target_session' ({target}) phải lớn hơn phiên cuối ({last_session})."
         )
 
     gap = target - last_session
 
-    # Dự đoán phiên kế tiếp (last_session + 1)
+    # Phân tích cầu cho phiên kế tiếp
     prediction, bridge, confidence, note = analyze_bridge_pattern(results, totals)
 
-    # Nếu target > last + 1 → mô phỏng chuỗi cầu đến target
-    forecast = None
-    if gap > 1:
-        forecast = forecast_bridge_until(results, totals, last_session, target)
-        # Nếu target nằm trong chuỗi forecast → lấy đúng phiên đó làm kết quả chính
-        for step in forecast:
-            if step["session"] == target:
-                prediction = step["prediction"]
-                confidence = step["confidence"]
-                bridge = step["bridge"]
-                note = f"Dự đoán cho phiên {target} (cách {gap} phiên từ phiên cuối)."
-                break
+    # Tính % Tài / % Xỉu
+    c_tai, c_xiu = compute_both_confidence(prediction, confidence)
 
     return {
         "target_session": target,
         "prediction": prediction,
-        "confidence": confidence,
+        "confidence": round(confidence, 4),
+        "confidence_tai": c_tai,
+        "confidence_xiu": c_xiu,
         "detected_bridge": bridge,
         "analysis": {
             "last_session": last_session,
@@ -251,16 +236,14 @@ def predict_tai_xiu(data: PredictRequest):
             "gap_from_last": gap,
             "note": note
         },
-        "bridge_forecast": forecast,
-        "forecast_until": target if forecast else None,
         "gap": gap
     }
 
 
-@app.post("/forecast")
-def forecast_only(data: PredictRequest):
+@app.post("/predict/batch")
+def predict_batch(data: PredictRequest):
     """
-    Chạy mô phỏng cầu theo đúng session ID đến target_session.
+    Dự đoán nhiều phiên liên tiếp (nếu target_session cách xa).
     """
     if not data.history:
         raise HTTPException(status_code=400, detail="Mảng 'history' không được để trống.")
@@ -269,26 +252,36 @@ def forecast_only(data: PredictRequest):
 
     sorted_history = sorted(data.history, key=lambda x: x.session)
     processed = preprocess_history(sorted_history)
-
-    if not processed:
-        raise HTTPException(status_code=400, detail="Không có dữ liệu hợp lệ.")
-
     results = [item["result"] for item in processed]
     totals = [item["total"] for item in processed]
     last_session = processed[-1]["session"]
 
     if data.target_session <= last_session:
-        raise HTTPException(
-            status_code=400,
-            detail=f"'target_session' phải lớn hơn phiên cuối ({last_session})."
-        )
+        raise HTTPException(status_code=400, detail=f"'target_session' phải lớn hơn {last_session}.")
 
-    steps = forecast_bridge_until(results, totals, last_session, data.target_session)
+    steps = []
+    MAX_GAP = 200
+    gap = data.target_session - last_session
+    start = data.target_session - MAX_GAP if gap > MAX_GAP else last_session + 1
+
+    sim_r, sim_t = list(results), list(totals)
+    for sess in range(start, data.target_session + 1):
+        pred, bridge, conf, _ = analyze_bridge_pattern(sim_r, sim_t)
+        c_tai, c_xiu = compute_both_confidence(pred, conf)
+        steps.append({
+            "session": sess,
+            "prediction": pred,
+            "confidence": round(conf, 4),
+            "confidence_tai": c_tai,
+            "confidence_xiu": c_xiu,
+            "bridge": bridge
+        })
+        sim_r.append(pred)
+        sim_t.append(12 if pred == "tai" else 9)
 
     return {
         "from_session": last_session,
         "to_session": data.target_session,
-        "gap": data.target_session - last_session,
         "total_steps": len(steps),
-        "bridge_forecast": steps
+        "forecast": steps
     }
